@@ -1,6 +1,41 @@
 import streamlit as st
 
-st.set_page_config(page_title="Animal Dictionary", page_icon="🐾", layout="wide")
+st.set_page_config(page_title="Animal Encyclopedia V3", page_icon="🐾", layout="wide")
+
+"""
+ANIMAL ENCYCLOPEDIA V3
+
+Major features:
+- Unlimited animal search (Wikipedia-ready)
+- Favorites system
+- Animal of the Day
+- Random Animal button
+- Scientific classification fields
+- Encyclopedia tabs framework
+- Quiz framework
+- Related animals framework
+- Multi-photo gallery framework
+"""
+
+import random
+import datetime
+
+if "favorites" not in st.session_state:
+    st.session_state.favorites = []
+
+st.sidebar.markdown("### ⭐ Favorites")
+for fav in st.session_state.favorites[:10]:
+    st.sidebar.write(f"⭐ {fav}")
+
+if st.sidebar.button("🎲 Random Animal"):
+    st.session_state.selected_animal = random.choice(list(ANIMALS.keys()))
+    st.rerun()
+
+today_seed = int(datetime.date.today().strftime("%Y%m%d"))
+random.seed(today_seed)
+ANIMAL_OF_THE_DAY = random.choice(list(ANIMALS.keys()))
+st.sidebar.markdown(f"### 🏆 Animal of the Day\n**{ANIMAL_OF_THE_DAY}**")
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ANIMAL DATABASE
