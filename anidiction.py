@@ -1,7 +1,7 @@
 import streamlit as st
 st.set_page_config(page_title="Animal Encyclopedia", page_icon="🐾", layout="wide", initial_sidebar_state="expanded")
 
-import random, datetime, urllib.parse, json, math
+import random, datetime, urllib.parse, json, math, re
 
 try:
     import requests as _req
@@ -249,38 +249,113 @@ def _get(url, params=None, timeout=6):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def wiki_search(q):
-    r = _get("https://en.wikipedia.org/w/api.php", {
-        "action":"query","list":"search","srsearch":q+" animal species",
-        "srnamespace":"0","srlimit":"18","srprop":"snippet","format":"json"})
-    if not r: return []
+    """
+    Multi-strategy Wikipedia search that finds virtually any animal.
+    Strategy 1: direct page lookup (handles exact names like 'Betta fish', 'Tardigrade')
+    Strategy 2: opensearch autocomplete (catches common names)
+    Strategy 3: full-text search (catches obscure/scientific names)
+    """
     BAD = ["film","movie","album","band","song","footballer","politician","actor",
            "singer","book","novel","video game","television","series","disambiguation",
-           "hurricane","typhoon","operation","character","episode","list of"]
-    out=[]
-    for item in r.json().get("query",{}).get("search",[]):
-        t,s=item["title"],item.get("snippet","")
-        if any(b in (t+s).lower() for b in BAD): continue
-        out.append(t)
-        if len(out)>=9: break
-    return out
+           "hurricane","typhoon","operation","character","episode","list of",
+           "municipality","city","town","village","county","district","province"]
+
+    results = []
+    seen = set()
+
+    def add(title, snippet=""):
+        if title in seen: return
+        combined = (title + " " + snippet).lower()
+        if any(b in combined for b in BAD): return
+        seen.add(title)
+        results.append(title)
+
+    # Strategy 1: Direct page lookup — works perfectly for "Betta fish", "Tardigrade", etc.
+    r1 = _get("https://en.wikipedia.org/w/api.php", {
+        "action": "query", "titles": q,
+        "prop": "info|extracts", "exintro": "1", "exsentences": "1",
+        "redirects": "1", "format": "json"})
+    if r1:
+        pages = r1.json().get("query", {}).get("pages", {})
+        for pid, page in pages.items():
+            if pid != "-1":  # -1 means not found
+                add(page.get("title", q))
+
+    # Strategy 2: OpenSearch autocomplete — great for common names
+    r2 = _get("https://en.wikipedia.org/w/api.php", {
+        "action": "opensearch", "search": q,
+        "limit": "8", "namespace": "0", "format": "json"})
+    if r2:
+        titles = r2.json()[1] if len(r2.json()) > 1 else []
+        for t in titles:
+            add(t)
+
+    # Strategy 3: Full-text search — catches scientific names and rare species
+    r3 = _get("https://en.wikipedia.org/w/api.php", {
+        "action": "query", "list": "search",
+        "srsearch": q, "srnamespace": "0",
+        "srlimit": "10", "srprop": "snippet", "format": "json"})
+    if r3:
+        for item in r3.json().get("query", {}).get("search", []):
+            add(item["title"], item.get("snippet", ""))
+
+    # Filter to likely animal articles using Wikipedia's description field
+    final = []
+    ANIMAL_HINTS = ["animal","species","fish","bird","mammal","reptile","amphibian",
+                    "insect","invertebrate","arthropod","mollus","crustacean","arachnid",
+                    "worm","cnidarian","echinoderm","bacterium","protist","fungus",
+                    "genus","family","order","class","phylum","organism","creature",
+                    "fauna","wildlife","predator","prey","herbivore","carnivore",
+                    "parasite","microorganism","tardigrade","microscopic"]
+    NOT_ANIMAL = ["film","album","song","band","footballer","actor","singer",
+                  "municipality","city","town","village","novel","video game",
+                  "television","hurricane","politician","person","athlete"]
+
+    for title in results:
+        tl = title.lower()
+        # immediately reject obvious non-animals
+        if any(b in tl for b in NOT_ANIMAL): continue
+        # check the Wikipedia description field quickly
+        safe = urllib.parse.quote(title.replace(" ", "_"))
+        rd = _get(f"https://en.wikipedia.org/api/rest_v1/page/summary/{safe}")
+        if rd:
+            d = rd.json()
+            desc_field = d.get("description", "").lower()
+            extract    = d.get("extract", "")[:300].lower()
+            combined   = desc_field + " " + extract
+            # accept if any animal hint found, or no NOT_ANIMAL flag
+            is_animal = any(h in combined for h in ANIMAL_HINTS)
+            is_not    = any(b in desc_field for b in NOT_ANIMAL)
+            if is_animal and not is_not:
+                final.append(title)
+            elif not is_not and title not in [r["title"] if isinstance(r,dict) else r for r in final]:
+                # ambiguous — include anyway, user can decide
+                final.append(title)
+        else:
+            final.append(title)  # network error — include optimistically
+        if len(final) >= 9:
+            break
+
+    return final[:9]
+
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def wiki_summary(title):
-    safe=urllib.parse.quote(title.replace(" ","_"))
-    r=_get(f"https://en.wikipedia.org/api/rest_v1/page/summary/{safe}")
+    safe = urllib.parse.quote(title.replace(" ","_"))
+    r = _get(f"https://en.wikipedia.org/api/rest_v1/page/summary/{safe}")
     return r.json() if r else {}
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def wiki_images(title):
-    r=_get("https://en.wikipedia.org/w/api.php",{
+    r = _get("https://en.wikipedia.org/w/api.php", {
         "action":"query","titles":title,"prop":"images","imlimit":"30","format":"json"})
     if not r: return []
-    BAD=["flag","icon","logo","map","symbol","blank","commons","wikimedia","edit",
-         "question","sound","audio","silhouette","range","distribution","coa","coat"]
-    out=[]
+    BAD = ["flag","icon","logo","map","symbol","blank","commons","wikimedia","edit",
+           "question","sound","audio","silhouette","range","distribution","coa","coat"]
+    out = []
     for p in r.json().get("query",{}).get("pages",{}).values():
         for img in p.get("images",[]):
-            nm=img["title"].lower()
+            nm = img["title"].lower()
             if any(b in nm for b in BAD): continue
             if nm.endswith((".svg",".ogg",".ogv",".webm",".pdf")): continue
             out.append(img["title"])
@@ -288,76 +363,333 @@ def wiki_images(title):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def resolve_img(ft):
-    r=_get("https://en.wikipedia.org/w/api.php",{
+    r = _get("https://en.wikipedia.org/w/api.php", {
         "action":"query","titles":ft,"prop":"imageinfo",
         "iiprop":"url|dimensions","iiurlwidth":"500","format":"json"})
     if not r: return None
     for p in r.json().get("query",{}).get("pages",{}).values():
-        info=p.get("imageinfo",[])
+        info = p.get("imageinfo",[])
         if info: return info[0].get("thumburl") or info[0].get("url")
     return None
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def gbif_lookup(scientific_name):
-    """Look up GBIF species key and return taxon info + occurrence count."""
-    r=_get("https://api.gbif.org/v1/species/match",{"name":scientific_name,"verbose":"false"})
-    if not r: return {}
-    d=r.json()
-    if d.get("matchType")=="NONE": return {}
-    key=d.get("usageKey")
-    if not key: return {}
-    # fetch occurrence count
-    r2=_get(f"https://api.gbif.org/v1/occurrence/search",{"taxonKey":key,"limit":"0"})
-    occ_count=0
-    if r2:
-        occ_count=r2.json().get("count",0)
+def gbif_lookup(name):
+    """
+    GBIF lookup — tries the exact name first, then falls back to a fuzzy match.
+    Works with common names ('Betta fish'), scientific names ('Betta splendens'),
+    and everything in between.
+    """
+    # Try exact match first
+    r = _get("https://api.gbif.org/v1/species/match", {
+        "name": name, "verbose": "false"})
+    d = r.json() if r else {}
+
+    # If no match, try without 'fish'/'bird' suffix words
+    if not d or d.get("matchType") == "NONE":
+        clean = re.sub(r'\b(fish|bird|snake|frog|worm|spider|beetle|fly|bee|ant|shark|whale|bear|cat|dog|wolf|fox)\b', '', name, flags=re.I).strip()
+        if clean and clean != name:
+            r2 = _get("https://api.gbif.org/v1/species/match", {
+                "name": clean, "verbose": "false"})
+            if r2: d = r2.json()
+
+    if not d or d.get("matchType") == "NONE":
+        return {}
+
+    key = d.get("usageKey")
+    if not key:
+        return {}
+
+    # Fetch occurrence count
+    r3 = _get("https://api.gbif.org/v1/occurrence/search", {"taxonKey": key, "limit": "0"})
+    occ_count = r3.json().get("count", 0) if r3 else 0
+
     return {
         "gbif_key": key,
-        "kingdom": d.get("kingdom",""),
-        "phylum":  d.get("phylum",""),
-        "class_":  d.get("clazz",""),
-        "order":   d.get("order",""),
-        "family":  d.get("family",""),
-        "genus":   d.get("genus",""),
-        "species": d.get("species",""),
-        "status":  d.get("status",""),
+        "kingdom": d.get("kingdom", ""),
+        "phylum":  d.get("phylum", ""),
+        "class_":  d.get("clazz", ""),
+        "order":   d.get("order", ""),
+        "family":  d.get("family", ""),
+        "genus":   d.get("genus", ""),
+        "species": d.get("species", ""),
+        "status":  d.get("status", ""),
         "occurrence_count": occ_count,
         "gbif_url": f"https://www.gbif.org/species/{key}",
     }
 
-def build_wiki_entry(title, summary):
-    desc=summary.get("extract","")
-    sentences=[s.strip() for s in desc.replace("\n"," ").split(". ") if s.strip()]
-    short=". ".join(sentences[:4])
-    if short and not short.endswith("."): short+="."
-    thumb=None
+def _parse_extract(text):
+    """
+    Scan the Wikipedia extract for diet, habitat, conservation, lifespan,
+    weight, speed and a fun-fact sentence. Returns a dict of found values.
+    All values remain as display strings (no numeric coercion needed here).
+    """
+    t = text.lower()
+    result = {}
+
+    # ── Diet ─────────────────────────────────────────────────────────────────
+    diet_map = [
+        (r'\b(carnivore|carnivorous|feeds? on (?:meat|fish|mammals?|birds?|insects?|invertebrates?|prey|other animals))\b', "Carnivore"),
+        (r'\b(herbivore|herbivorous|feeds? on (?:plants?|leaves?|grass|vegetation|bamboo|algae|seagrass))\b', "Herbivore"),
+        (r'\b(omnivore|omnivorous|feeds? on (?:both|variety of|plants? and|animals? and))\b', "Omnivore"),
+        (r'\b(insectivore|insectivorous|feeds? on insects?)\b', "Insectivore"),
+        (r'\b(filter.feed|suspension.feed)\b', "Filter Feeder"),
+        (r'\b(feeds? on (?:plankton|krill|zooplankton|phytoplankton))\b', "Filter Feeder"),
+        (r'\b(piscivore|piscivorous|feeds? (?:mainly |primarily )?on fish)\b', "Piscivore"),
+        (r'\b(frugivore|frugivorous|fruit.eating|feeds? on fruit)\b', "Frugivore"),
+        (r'\b(detritivore|detritivorous|feeds? on (?:decaying|detritus|dead matter))\b', "Detritivore"),
+        (r'\b(nectarivore|feeds? on nectar)\b', "Nectarivore"),
+        (r'\b(granivore|feeds? on seeds?|seed.eating)\b', "Granivore"),
+        (r'\b(parasite|parasitic|feeds? on (?:host|blood|tissue))\b', "Parasite"),
+        (r'\b(scavenger|scavenges?|feeds? on carrion)\b', "Scavenger"),
+        (r'\b(feeds? on|eats?|diet (?:consists?|is|includes?))\b', "Omnivore"),  # generic fallback
+    ]
+    for pat, label in diet_map:
+        if re.search(pat, t):
+            result["diet"] = label
+            break
+
+    # ── Conservation ─────────────────────────────────────────────────────────
+    con_map = [
+        (r'critically endangered', "Critically Endangered", "#dc2626"),
+        (r'\bendangered\b', "Endangered", "#ef4444"),
+        (r'vulnerable', "Vulnerable", "#fb923c"),
+        (r'near threatened', "Near Threatened", "#facc15"),
+        (r'least concern', "Least Concern", "#34d399"),
+        (r'data deficient', "Data Deficient", "#64748b"),
+        (r'iucn red list', "See IUCN Red List", "#a78bfa"),
+    ]
+    for pat, label, color in con_map:
+        if re.search(pat, t):
+            result["conservation"] = label
+            result["conservation_color"] = color
+            break
+
+    # ── Habitat — expanded to catch real Wikipedia phrasing ───────────────────
+    hab_map = [
+        (r'\b(coral reef|reef)\b', "Coral Reef"),
+        (r'\b(deep.?sea|deep ocean|abyssal|hadal)\b', "Deep Ocean"),
+        (r'\b(ocean|marine|sea|pelagic|open water)\b', "Ocean"),
+        (r'\b(tropical rainforest|jungle)\b', "Tropical Rainforest"),
+        (r'\b(freshwater|river|lake|pond|stream|creek|canal)\b', "Freshwater"),
+        (r'\b(tundra|arctic|polar|permafrost)\b', "Arctic / Tundra"),
+        (r'\b(desert|arid|xeric)\b', "Desert"),
+        (r'\b(savann|grassland|prairie|steppe)\b', "Savanna / Grassland"),
+        (r'\b(mountain|alpine|himalay|high.?altitude)\b', "Mountain"),
+        (r'\b(rainforest|tropical forest|tropical)\b', "Tropical Forest"),
+        (r'\b(forest|woodland|taiga|boreal|temperate)\b', "Forest"),
+        (r'\b(wetland|marsh|swamp|mangrove|estuar)\b', "Wetland"),
+        (r'\b(cave|subterranean|underground)\b', "Cave / Underground"),
+        (r'\b(moss|lichen|soil|leaf litter|bark)\b', "Terrestrial / Soil"),
+        (r'\b(ubiquitous|every habitat|all environment|worldwide habitat|found everywhere)\b', "Widespread"),
+        (r'\b(parasit|host|endoparasit|ectoparasit)\b', "Parasitic"),
+        (r'\b(xochimilco|mexico city lake)\b', "Freshwater Lake"),
+        (r'\b(aquatic|water)\b', "Aquatic"),
+        (r'\b(terrestrial|land)\b', "Terrestrial"),
+    ]
+    for pat, label in hab_map:
+        if re.search(pat, t):
+            result["habitat"] = label
+            break
+
+    # ── Region / Continent ───────────────────────────────────────────────────
+    region_map = [
+        (r'\b(africa)\b', "Africa", "Africa"),
+        (r'\b(south america|amazon|brazil|peru|colombia)\b', "South America", "South America"),
+        (r'\b(north america|united states|canada|mexico)\b', "North America", "North America"),
+        (r'\b(australia|oceania|new zealand)\b', "Australia / Oceania", "Australia"),
+        (r'\b(europe)\b', "Europe", "Europe"),
+        (r'\b(southeast asia|indonesia|philippines|borneo)\b', "Southeast Asia", "Asia"),
+        (r'\b(china|japan|korea)\b', "East Asia", "Asia"),
+        (r'\b(india|south asia)\b', "South Asia", "Asia"),
+        (r'\b(arctic|antarct)\b', "Polar Regions", "Arctic"),
+        (r'\b(worldwide|global|cosmopolitan|throughout the world|all ocean)\b', "Worldwide", "Worldwide"),
+    ]
+    for pat, region, cont in region_map:
+        if re.search(pat, t):
+            result["region"] = region
+            result["continent"] = cont
+            break
+
+    # ── Lifespan ─────────────────────────────────────────────────────────────
+    ls = re.search(r'(?:live|lifespan|live up to|lives? (?:for )?(?:up to )?)([\d]+)(?:\s*(?:to|–|-)\s*([\d]+))?\s*years', t)
+    if ls:
+        lo, hi = ls.group(1), ls.group(2)
+        result["lifespan_display"] = f"{lo}–{hi} years" if hi else f"~{lo} years"
+        result["lifespan_years"] = int(hi or lo)
+
+    # ── Weight ───────────────────────────────────────────────────────────────
+    wt = re.search(r'weigh(?:s|ing|t)?\s+(?:up to\s+)?([\d,\.]+)\s*(kg|g|lb|ton)', t)
+    if wt:
+        val_str = wt.group(1).replace(",","")
+        unit = wt.group(2)
+        try:
+            val = float(val_str)
+            if unit == "g":   val /= 1000
+            elif unit == "lb": val *= 0.453592
+            elif unit == "ton": val *= 1000
+            result["weight_kg"] = round(val, 3) if val < 1 else round(val)
+            result["weight_display"] = f"{wt.group(1)} {unit}"
+        except ValueError:
+            pass
+
+    # ── Speed ────────────────────────────────────────────────────────────────
+    sp = re.search(r'([\d]+)\s*(?:km/h|kilometres? per hour|mph)', t)
+    if sp:
+        try:
+            spd = float(sp.group(1))
+            if "mph" in t[sp.start():sp.end()+3]:
+                spd = round(spd * 1.60934)
+            result["speed_kmh"] = int(spd)
+        except ValueError:
+            pass
+
+    # ── Fun fact — pick the most interesting sentence ─────────────────────────
+    sentences = [s.strip() for s in text.replace("\n"," ").split(". ") if len(s.strip()) > 40]
+    fact_keywords = ["largest","smallest","fastest","only","unique","never","always",
+                     "can","million","thousand","record","world","known","first","last"]
+    best = None
+    for s in sentences[1:]:   # skip the first (usually the definition)
+        if any(k in s.lower() for k in fact_keywords):
+            best = s.strip()
+            if not best.endswith("."): best += "."
+            break
+    if best:
+        result["fun_fact"] = best
+
+    return result
+
+
+def _emoji_for_category(cat):
+    m = {
+        "Fish":"🐟","Mammal":"🦁","Bird":"🐦","Reptile":"🦎",
+        "Amphibian":"🐸","Insect":"🦋","Spider":"🕷️","Crustacean":"🦀",
+        "Mollusca":"🐌","Cephalopod":"🐙","Worm":"🪱","Cnidarian":"🪸",
+        "Invertebrate":"🦗",
+    }
+    for k,v in m.items():
+        if k.lower() in cat.lower(): return v
+    return "🐾"
+
+
+def build_wiki_entry(title, summary, gbif_data=None):
+    """Build a full animal data dict from Wikipedia summary + optional GBIF data."""
+    desc = summary.get("extract", "")
+    sentences = [s.strip() for s in desc.replace("\n"," ").split(". ") if s.strip()]
+    short = ". ".join(sentences[:4])
+    if short and not short.endswith("."): short += "."
+
+    thumb = None
     if "thumbnail" in summary:
-        raw=summary["thumbnail"].get("source","")
+        raw = summary["thumbnail"].get("source","")
         for o,n in [("/200px-","/600px-"),("/320px-","/600px-"),("/400px-","/600px-")]:
-            if o in raw: raw=raw.replace(o,n); break
-        thumb=raw
-    wiki_url=summary.get("content_urls",{}).get("desktop",{}).get("page","")
-    cat=summary.get("description","Animal").split(",")[0].strip().title() or "Animal"
+            if o in raw: raw = raw.replace(o,n); break
+        thumb = raw
+
+    wiki_url = summary.get("content_urls",{}).get("desktop",{}).get("page","")
+
+    # Category from Wikipedia description field e.g. "species of fish"
+    wiki_desc_field = summary.get("description","")
+    cat = "Animal"
+    for token in ["fish","mammal","bird","reptile","amphibian","insect","spider",
+                  "crustacean","mollusc","worm","cnidarian","invertebrate","cephalopod"]:
+        if token in wiki_desc_field.lower() or token in desc[:200].lower():
+            cat = token.title()
+            break
+
+    # Parse extract for stats
+    parsed = _parse_extract(desc)
+
+    # Taxonomy — prefer GBIF, fall back to parsed or "—"
+    g = gbif_data or {}
+    kingdom  = g.get("kingdom") or "Animalia"
+    phylum   = g.get("phylum")  or "—"
+    class_   = g.get("class_") or g.get("clazz") or "—"
+    order    = g.get("order")   or "—"
+    family   = g.get("family")  or "—"
+    genus    = g.get("genus")   or "—"
+    sci_name = g.get("species") or title  # GBIF "species" field = "Genus species"
+
+    # Override category with GBIF class if available
+    if class_ and class_ != "—":
+        class_lower = class_.lower()
+        class_map = {
+            "mammalia":"Mammal","aves":"Bird","reptilia":"Reptile",
+            "amphibia":"Amphibian","actinopterygii":"Fish","chondrichthyes":"Fish",
+            "insecta":"Insect","arachnida":"Spider","malacostraca":"Crustacean",
+            "cephalopoda":"Cephalopod","gastropoda":"Mollusca",
+        }
+        for k,v in class_map.items():
+            if k in class_lower:
+                cat = v; break
+
+    emoji = _emoji_for_category(cat)
+
+    lifespan_years   = parsed.get("lifespan_years", 0)
+    lifespan_display = parsed.get("lifespan_display", "—")
+    weight_kg        = parsed.get("weight_kg", 0)
+    weight_display   = parsed.get("weight_display", "—")
+    speed_kmh        = parsed.get("speed_kmh", 0)
+
+    conservation       = parsed.get("conservation", "Unknown")
+    conservation_color = parsed.get("conservation_color", "#64748b")
+    habitat  = parsed.get("habitat", "—")
+    diet     = parsed.get("diet", "—")
+    region   = parsed.get("region", "—")
+    continent= parsed.get("continent", "—")
+    fun_fact = parsed.get("fun_fact", f"{title} is a fascinating species — explore Wikipedia for more details.")
+
     return {
-        "emoji":"🐾","category":cat,"habitat":"—","diet":"—",
-        "lifespan_years":0,"weight_kg":0,"speed_kmh":0,
-        "conservation":"Unknown","conservation_color":"#64748b",
-        "region":"—","continent":"—",
-        "scientific_name":"—","kingdom":"Animalia","phylum":"—",
-        "class_":"—","order":"—","family":"—","genus":"—",
-        "fun_fact":"Search Wikipedia or GBIF for more fascinating facts!",
-        "description":short or "No description available.",
-        "related":[],"image_query":urllib.parse.quote(title.lower()),
-        "wiki_url":wiki_url,"wiki_thumb":thumb,"wiki_title":title,"_from_wiki":True,
+        "emoji": emoji,
+        "category": cat,
+        "habitat": habitat,
+        "diet": diet,
+        "lifespan_years": lifespan_years,
+        "lifespan_display": lifespan_display,
+        "weight_kg": weight_kg,
+        "weight_display": weight_display,
+        "speed_kmh": speed_kmh,
+        "conservation": conservation,
+        "conservation_color": conservation_color,
+        "region": region,
+        "continent": continent,
+        "scientific_name": sci_name,
+        "kingdom": kingdom,
+        "phylum": phylum,
+        "class_": class_,
+        "order": order,
+        "family": family,
+        "genus": genus,
+        "fun_fact": fun_fact,
+        "description": short or "No description available.",
+        "related": [],
+        "image_query": urllib.parse.quote(title.lower()),
+        "wiki_url": wiki_url,
+        "wiki_thumb": thumb,
+        "wiki_title": title,
+        "_from_wiki": True,
     }
 
+
+def _is_stale(entry):
+    if not entry: return True
+    if entry.get("fun_fact","").startswith("Search Wikipedia or GBIF"): return True
+    if entry.get("habitat","—") == "—" and entry.get("diet","—") == "—" and entry.get("region","—") == "—": return True
+    return False
+
 def load_wiki(title):
-    if title in st.session_state.wiki_cache:
-        return st.session_state.wiki_cache[title]
-    s=wiki_summary(title)
+    cached = st.session_state.wiki_cache.get(title)
+    if cached and not _is_stale(cached):
+        return cached
+    s = wiki_summary(title)
     if not s: return None
-    e=build_wiki_entry(title,s)
-    st.session_state.wiki_cache[title]=e
+    # Try GBIF with Wikipedia's canonical title first (often the scientific name),
+    # then fall back to the common name the user typed
+    sci_hint = s.get("title", title)
+    gbif_data = gbif_lookup(sci_hint)
+    if not gbif_data:
+        gbif_data = gbif_lookup(title)
+    e = build_wiki_entry(title, s, gbif_data)
+    st.session_state.wiki_cache[title] = e
     return e
 
 def get_data(name):
@@ -633,12 +965,12 @@ def page_detail():
       <p class="dd">{data['description']}</p>
       <div class="ff"><div class="lb">✦ Did you know?</div><div class="tx">{data['fun_fact']}</div></div>
       <div class="sg">
-        <div class="sc"><div class="sl">Habitat</div><div class="sv">{data['habitat']}</div></div>
-        <div class="sc"><div class="sl">Diet</div><div class="sv">{data['diet']}</div></div>
-        <div class="sc"><div class="sl">Lifespan</div><div class="sv">{str(data.get('lifespan_years','—'))+' yrs' if data.get('lifespan_years') else '—'}</div></div>
-        <div class="sc"><div class="sl">Weight</div><div class="sv">{(str(data.get('weight_kg'))+ ' kg') if data.get('weight_kg') else '—'}</div></div>
-        <div class="sc"><div class="sl">Top Speed</div><div class="sv">{(str(data.get('speed_kmh'))+ ' km/h') if data.get('speed_kmh') else '—'}</div></div>
-        <div class="sc"><div class="sl">Region</div><div class="sv">{data.get('region','—')}</div></div>
+        <div class="sc"><div class="sl">Habitat</div><div class="sv">{data.get('habitat') or '—'}</div></div>
+        <div class="sc"><div class="sl">Diet</div><div class="sv">{data.get('diet') or '—'}</div></div>
+        <div class="sc"><div class="sl">Lifespan</div><div class="sv">{data.get('lifespan_display') or (str(data['lifespan_years'])+' yrs' if data.get('lifespan_years') else '—')}</div></div>
+        <div class="sc"><div class="sl">Weight</div><div class="sv">{data.get('weight_display') or (str(data['weight_kg'])+' kg' if data.get('weight_kg') else '—')}</div></div>
+        <div class="sc"><div class="sl">Top Speed</div><div class="sv">{str(data['speed_kmh'])+' km/h' if data.get('speed_kmh') else '—'}</div></div>
+        <div class="sc"><div class="sl">Region</div><div class="sv">{data.get('region') or '—'}</div></div>
       </div>
     </div>
     """, unsafe_allow_html=True)
